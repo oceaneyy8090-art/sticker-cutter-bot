@@ -29,3 +29,4 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           REMOVE_BG_API_KEY: ${{ secrets.REMOVE_BG_API_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
