@@ -20,10 +20,10 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Download repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Run bot
+      - name: Start bot
         run: npm start
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
