@@ -6,48 +6,23 @@ const sharp = require("sharp");
 
 const TOKEN = process.env.BOT_TOKEN;
 const REMOVE_BG_API_KEY = process.env.REMOVE_BG_API_KEY;
-const OWNER_ID = process.env.OWNER_ID;
 
-if (!TOKEN || !REMOVE_BG_API_KEY || !OWNER_ID) {
+if (!TOKEN || !REMOVE_BG_API_KEY) {
   throw new Error(
-    "BOT_TOKEN، REMOVE_BG_API_KEY یا OWNER_ID تنظیم نشده!"
+    "BOT_TOKEN یا REMOVE_BG_API_KEY تنظیم نشده!"
   );
 }
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 const api = `https://api.telegram.org/bot${TOKEN}`;
 
-const PACK_PREFIX = "cutie";
 const PACK_TITLE = "Cute Stickers";
-
 const processing = new Set();
 const userPacks = new Map();
 
-bot.onText(/\/start/, async (msg) => {
-  await bot.sendMessage(
-    msg.chat.id,
-    "🌙 سلام به استیکرساز کوچولو!\n\n" +
-    "🍓 عکست رو بفرست تا پس‌زمینه‌ش حذف بشه.\n" +
-    "💫 استیکرت رو تحویل بگیر!\n\n" +
-    "برای دیدن پک استیکرهات /pack رو بزن."
-  );
-});
-
-bot.onText(/\/pack/, async (msg) => {
-  const packName = userPacks.get(msg.from.id);
-
-  if (!packName) {
-    return bot.sendMessage(
-      msg.chat.id,
-      "🍓 هنوز پکی نساختی! اول یه عکس بفرست."
-    );
-  }
-
-  await bot.sendMessage(
-    msg.chat.id,
-    `🌙 پک استیکرت:\nhttps://t.me/addstickers/${packName}`
-  );
-});
+function makePackName(userId) {
+  return `cutie_by_${userId}_bot`;
+}
 
 async function telegramRequest(method, form) {
   const response = await axios.post(
@@ -87,19 +62,40 @@ function createStickerForm(buffer, method, extra = {}) {
     contentType: "image/webp"
   });
 
-  form.append(
-    method === "createNewStickerSet" ? "stickers" : "sticker",
-    method === "createNewStickerSet"
-      ? JSON.stringify([sticker])
-      : JSON.stringify(sticker)
-  );
+  if (method === "createNewStickerSet") {
+    form.append("stickers", JSON.stringify([sticker]));
+  } else {
+    form.append("sticker", JSON.stringify(sticker));
+  }
 
   return form;
 }
 
-function makePackName(userId) {
-  return `${PACK_PREFIX}_by_${userId}_bot`;
-}
+bot.onText(/^\/start(?:@\w+)?(?:\s|$)/, async (msg) => {
+  await bot.sendMessage(
+    msg.chat.id,
+    "🌙 سلام به استیکرساز کوچولو!\n\n" +
+    "🍓 یه عکس بفرست تا پس‌زمینه‌ش حذف بشه.\n" +
+    "💫 استیکرت رو دریافت کن و به پک خودت اضافه کن!\n\n" +
+    "برای دریافت لینک پک خودت /pack رو بزن."
+  );
+});
+
+bot.onText(/^\/pack(?:@\w+)?(?:\s|$)/, async (msg) => {
+  const packName = userPacks.get(msg.from.id);
+
+  if (!packName) {
+    return bot.sendMessage(
+      msg.chat.id,
+      "🍓 هنوز پکی نساختی! اول یه عکس بفرست."
+    );
+  }
+
+  await bot.sendMessage(
+    msg.chat.id,
+    `🌙 لینک پک استیکرهات:\nhttps://t.me/addstickers/${packName}`
+  );
+});
 
 bot.on("photo", async (msg) => {
   const chatId = msg.chat.id;
@@ -108,7 +104,7 @@ bot.on("photo", async (msg) => {
   if (processing.has(userId)) {
     return bot.sendMessage(
       chatId,
-      "⏳ صبر کن، هنوز دارم عکس قبلیت رو آماده می‌کنم!"
+      "⏳ یه کوچولو صبر کن؛ هنوز دارم عکس قبلیت رو آماده می‌کنم!"
     );
   }
 
@@ -117,7 +113,7 @@ bot.on("photo", async (msg) => {
   try {
     await bot.sendMessage(
       chatId,
-      "💫 دارم پس‌زمینه رو حذف می‌کنم..."
+      "💫 دارم پس‌زمینهٔ عکست رو حذف می‌کنم..."
     );
 
     const photos = msg.photo;
@@ -157,17 +153,22 @@ bot.on("photo", async (msg) => {
         fit: "inside",
         withoutEnlargement: true
       })
-      .webp({ quality: 85, alphaQuality: 100 })
+      .webp({
+        quality: 85,
+        alphaQuality: 100
+      })
       .toBuffer();
 
     if (sticker.length > 512 * 1024) {
       throw new Error("Sticker file too large");
     }
 
+    // Send the sticker directly to the user.
     await bot.sendSticker(chatId, sticker, {
       reply_to_message_id: msg.message_id
     });
 
+    // Every Telegram user gets their own sticker pack.
     const packName = makePackName(userId);
     let packExists = false;
 
@@ -206,9 +207,10 @@ bot.on("photo", async (msg) => {
 
     await bot.sendMessage(
       chatId,
-      `🍓 استیکرت ساخته شد و به پک اختصاصی‌ات اضافه شد!\n\n` +
+      "🍓 استیکرت ساخته شد و به پک اختصاصی‌ات اضافه شد!\n\n" +
       `🌙 https://t.me/addstickers/${packName}`
     );
+
   } catch (error) {
     console.error(
       "Processing error:",
@@ -221,6 +223,11 @@ bot.on("photo", async (msg) => {
       message = "🍓 اعتبار Remove.bg تموم شده.";
     } else if (error.response?.status === 403) {
       message = "🔑 کلید Remove.bg معتبر نیست.";
+    } else if (
+      error.response?.data?.description?.includes("STICKERSET")
+    ) {
+      message =
+        "🌙 ساخت پک استیکر مشکل داشت؛ استیکر ارسال‌شده رو داری، دوباره امتحان کن.";
     }
 
     try {
