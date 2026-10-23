@@ -8,70 +8,81 @@ const TOKEN = process.env.BOT_TOKEN;
 const REMOVE_BG_KEY = process.env.REMOVE_BG_API_KEY;
 
 if (!TOKEN || !REMOVE_BG_KEY) {
-  throw new Error(
-    "Missing BOT_TOKEN or REMOVE_BG_API_KEY in GitHub Secrets"
-  );
+  throw new Error("BOT_TOKEN یا REMOVE_BG_API_KEY تنظیم نشده");
 }
 
 const bot = new TelegramBot(TOKEN, { polling: true });
-const processedImages = new Map();
-let botUsername = "";
+const pending = new Map();
+const sessions = new Map();
 
-const mainMenu = {
+const menu = {
   inline_keyboard: [
-    [{ text: "✂️ حذف پس‌زمینه عکس", callback_data: "help" }],
-    [{ text: "📦 ساخت پک استیکر", callback_data: "pack" }],
-    [{ text: "✨ راهنمای استفاده", callback_data: "guide" }]
+    [{ text: "✂️ حذف پس‌زمینه", callback_data: "remove" }],
+    [{ text: "📦 ساخت پک مشترک", callback_data: "create_pack" }],
+    [{ text: "➕ افزودن به پک", callback_data: "add_pack" }]
   ]
 };
 
-function photoMenu() {
-  return {
-    inline_keyboard: [
-      [{ text: "📦 ساخت پک / افزودن استیکر", callback_data: "pack" }],
-      [{ text: "🔄 پردازش عکس جدید", callback_data: "again" }],
-      [{ text: "🏠 منوی اصلی", callback_data: "menu" }]
-    ]
-  };
+function session(id) {
+  if (!sessions.has(id)) sessions.set(id, {});
+  return sessions.get(id);
 }
 
-async function sendMenu(chatId) {
+bot.onText(/^\/start$/, async (msg) => {
   await bot.sendMessage(
-    chatId,
-    "🌙 به ربات استیکرساز خوش اومدی!\n\n" +
-      "عکس رو بفرست تا پس‌زمینه‌ش حذف بشه.",
-    { reply_markup: mainMenu }
+    msg.chat.id,
+    "🌙 عکس رو بفرست تا پس‌زمینه‌ش حذف بشه.\n" +
+    "بعد می‌تونی استیکر بسازی یا به پک مشترک اضافه کنی.",
+    { reply_markup: menu }
   );
-}
+});
 
-async function getPhotoBuffer(fileId) {
-  const file = await bot.getFile(fileId);
+bot.on("callback_query", async (q) => {
+  const chatId = q.message.chat.id;
+  const id = q.from.id;
+  const s = session(id);
 
-  if (!file.file_path) {
-    throw new Error("TELEGRAM_FILE_PATH_MISSING");
+  await bot.answerCallbackQuery(q.id).catch(() => {});
+
+  if (q.data === "remove") {
+    pending.set(id, "photo");
+    return bot.sendMessage(chatId, "📸 عکست رو بفرست.");
   }
 
-  const url =
-    `https://api.telegram.org/file/bot${TOKEN}/` +
-    file.file_path;
+  if (q.data === "create_pack") {
+    pending.set(id, "pack_title");
+    return bot.sendMessage(
+      chatId,
+      "اسم نمایشی پک رو بفرست.\n" +
+      "مثلاً: My Cute Stickers"
+    );
+  }
 
+  if (q.data === "add_pack") {
+    pending.set(id, "pack_name");
+    return bot.sendMessage(
+      chatId,
+      "نام کاربری پک رو بفرست؛ مثلاً MyCutePack_by_BotName"
+    );
+  }
+});
+
+async function getFile(fileId) {
+  const file = await bot.getFile(fileId);
+  const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`;
   const response = await axios.get(url, {
     responseType: "arraybuffer",
-    timeout: 60000,
-    maxContentLength: 20 * 1024 * 1024
+    timeout: 60000
   });
-
   return Buffer.from(response.data);
 }
 
-async function removeBackground(imageBuffer) {
+async function removeBackground(buffer) {
   const form = new FormData();
-
-  form.append("image_file", imageBuffer, {
+  form.append("image_file", buffer, {
     filename: "photo.jpg",
-    contentType: "image/jpeg"
+    contentType: "application/octet-stream"
   });
-
   form.append("size", "auto");
   form.append("format", "png");
 
@@ -84,55 +95,47 @@ async function removeBackground(imageBuffer) {
         "X-Api-Key": REMOVE_BG_KEY
       },
       responseType: "arraybuffer",
-      timeout: 120000,
-      maxContentLength: 25 * 1024 * 1024,
-      maxBodyLength: 25 * 1024 * 1024
+      timeout: 120000
     }
   );
 
   return Buffer.from(response.data);
 }
 
-async function makeSticker(imageBuffer) {
-  let output = await sharp(imageBuffer)
-    .rotate()
+async function makeSticker(buffer) {
+  let result = await sharp(buffer)
     .resize(512, 512, {
-      fit: "contain",
-      background: { r: 0, g: 0, b: 0, alpha: 0 }
+      fit: "inside",
+      withoutEnlargement: true
     })
-    .png({
-      palette: true,
-      quality: 80,
-      effort: 10
-    })
+    .png({ compressionLevel: 9 })
     .toBuffer();
 
-  if (output.length > 512 * 1024) {
-    output = await sharp(imageBuffer)
-      .rotate()
-      .resize(512, 512, { fit: "inside" })
-      .png({ compressionLevel: 9, effort: 10 })
+  if (result.length > 512 * 1024) {
+    result = await sharp(buffer)
+      .resize(384, 384, { fit: "inside" })
+      .png({ compressionLevel: 9, palette: true })
       .toBuffer();
   }
 
-  if (output.length > 512 * 1024) {
-    throw new Error("STICKER_TOO_LARGE");
+  if (result.length > 512 * 1024) {
+    throw new Error("حجم استیکر بیش از حد مجاز است");
   }
 
-  return output;
+  return result;
 }
 
-async function telegramMultipart(method, fields, fileBuffer) {
+async function uploadSticker(method, fields, buffer) {
   const form = new FormData();
 
   for (const [key, value] of Object.entries(fields)) {
     form.append(
       key,
-      typeof value === "string" ? value : JSON.stringify(value)
+      typeof value === "object" ? JSON.stringify(value) : String(value)
     );
   }
 
-  form.append("stickerfile", fileBuffer, {
+  form.append("sticker", buffer, {
     filename: "sticker.png",
     contentType: "image/png"
   });
@@ -148,232 +151,140 @@ async function telegramMultipart(method, fields, fileBuffer) {
   );
 
   if (!response.data.ok) {
-    throw new Error(response.data.description || "TELEGRAM_API_ERROR");
+    throw new Error(response.data.description || "Telegram API error");
   }
 
   return response.data.result;
 }
 
-async function createOrAddPack(userId, stickerBuffer) {
-  const packName =
-    `cut_${userId}_by_${botUsername}`.toLowerCase();
+async function createPack(userId, title, sticker) {
+  const me = await bot.getMe();
+  const safeName = me.username.replace(/[^a-zA-Z0-9_]/g, "");
+  const packName = `shared_${userId}_by_${safeName}`;
 
-  const sticker = {
-    sticker: "attach://stickerfile",
-    format: "static",
-    emoji_list: ["✨"]
-  };
+  await uploadSticker(
+    "createNewStickerSet",
+    {
+      user_id: userId,
+      name: packName,
+      title: title.slice(0, 64),
+      stickers: [{
+        sticker: "attach://sticker",
+        format: "static",
+        emoji_list: ["✨"]
+      }]
+    },
+    sticker
+  );
 
-  const createFields = {
-    user_id: String(userId),
-    name: packName,
-    title: "استیکرهای من ✨",
-    stickers: [sticker]
-  };
-
-  try {
-    await telegramMultipart(
-      "createNewStickerSet",
-      createFields,
-      stickerBuffer
-    );
-
-    return packName;
-  } catch (createError) {
-    const description =
-      createError.response?.data?.description || "";
-
-    const canTryAdd =
-      /already occupied|already exists|STICKERSET_INVALID|stickerset_invalid/i
-        .test(description);
-
-    if (!canTryAdd) {
-      throw createError;
-    }
-
-    await telegramMultipart(
-      "addStickerToSet",
-      {
-        user_id: String(userId),
-        name: packName,
-        sticker
-      },
-      stickerBuffer
-    );
-
-    return packName;
-  }
+  return packName;
 }
 
-bot.onText(/^\/start(?:@\w+)?$/, async (msg) => {
-  try {
-    await sendMenu(msg.chat.id);
-  } catch (error) {
-    console.error("START ERROR:", error.message);
-  }
-});
-
-bot.onText(/^\/menu(?:@\w+)?$/, async (msg) => {
-  await sendMenu(msg.chat.id).catch(console.error);
-});
-
-bot.on("callback_query", async (query) => {
-  const chatId = query.message?.chat.id;
-  const userId = query.from.id;
-  const action = query.data;
-
-  try {
-    await bot.answerCallbackQuery(query.id);
-
-    if (!chatId) return;
-
-    if (action === "menu") {
-      await sendMenu(chatId);
-      return;
-    }
-
-    if (action === "help" || action === "again") {
-      await bot.sendMessage(
-        chatId,
-        "📸 حالا عکس موردنظرت رو بفرست."
-      );
-      return;
-    }
-
-    if (action === "guide") {
-      await bot.sendMessage(
-        chatId,
-        "۱. عکس رو بفرست.\n" +
-          "۲. منتظر حذف پس‌زمینه بمون.\n" +
-          "۳. روی ساخت پک بزن.\n\n" +
-          "برای شفاف موندن پس‌زمینه، عکس خروجی PNG ساخته می‌شه.",
-        { reply_markup: mainMenu }
-      );
-      return;
-    }
-
-    if (action === "pack") {
-      const sticker = processedImages.get(userId);
-
-      if (!sticker) {
-        await bot.sendMessage(
-          chatId,
-          "اول یک عکس بفرست تا پردازش بشه. 🌙",
-          { reply_markup: mainMenu }
-        );
-        return;
+async function addToPack(userId, packName, sticker) {
+  await uploadSticker(
+    "addStickerToSet",
+    {
+      user_id: userId,
+      name: packName,
+      sticker: {
+        sticker: "attach://sticker",
+        format: "static",
+        emoji_list: ["✨"]
       }
+    },
+    sticker
+  );
+}
 
-      await bot.sendMessage(
-        chatId,
-        "📦 دارم پک استیکرت رو می‌سازم..."
-      );
+bot.on("photo", async (msg) => {
+  const id = msg.from.id;
+  const chatId = msg.chat.id;
 
-      const packName = await createOrAddPack(userId, sticker);
+  try {
+    await bot.sendMessage(chatId, "⏳ دارم پس‌زمینه رو حذف می‌کنم...");
 
-      await bot.sendMessage(
-        chatId,
-        "✨ استیکر به پک اضافه شد!\n\n" +
-          `https://t.me/addstickers/${packName}`,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [{
-                text: "🎀 باز کردن پک استیکر",
-                url: `https://t.me/addstickers/${packName}`
-              }],
-              [{
-                text: "🏠 منوی اصلی",
-                callback_data: "menu"
-              }]
-            ]
-          }
-        }
-      );
-    }
+    const photo = msg.photo[msg.photo.length - 1];
+    const original = await getFile(photo.file_id);
+    const transparent = await removeBackground(original);
+    const sticker = await makeSticker(transparent);
+
+    const s = session(id);
+    s.sticker = sticker;
+
+    await bot.sendDocument(chatId, transparent, {
+      filename: "transparent.png",
+      caption: "✨ عکس شفاف آماده شد!",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📦 ساخت پک جدید", callback_data: "create_pack" }],
+          [{ text: "➕ افزودن به پک", callback_data: "add_pack" }],
+          [{ text: "🏠 منوی اصلی", callback_data: "home" }]
+        ]
+      }
+    });
   } catch (error) {
-    console.error(
-      "BUTTON ERROR:",
-      error.response?.data || error.message
-    );
-
+    console.error("PHOTO ERROR:", error.response?.data || error.message);
     await bot.sendMessage(
       chatId,
-      "❌ ساخت پک انجام نشد.\n" +
-        "ممکنه محدودیت تلگرام یا خطای سرویس وجود داشته باشه. " +
-        "کمی بعد دوباره امتحان کن."
+      "❌ پردازش ناموفق بود. کلید Remove.bg، اعتبار و حجم عکس رو بررسی کن."
     ).catch(() => {});
   }
 });
 
-bot.on("photo", async (msg) => {
+bot.on("message", async (msg) => {
+  if (!msg.text || msg.text.startsWith("/")) return;
+
+  const id = msg.from.id;
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
+  const action = pending.get(id);
+  const s = session(id);
 
   try {
-    const photos = msg.photo || [];
-    const photo = photos[photos.length - 1];
-
-    if (!photo) {
-      await bot.sendMessage(chatId, "عکس معتبر دریافت نشد.");
-      return;
-    }
-
-    if (photo.file_size && photo.file_size > 15 * 1024 * 1024) {
-      await bot.sendMessage(
-        chatId,
-        "عکس خیلی بزرگه؛ لطفاً عکس کوچک‌تری بفرست."
-      );
-      return;
-    }
-
-    const status = await bot.sendMessage(
-      chatId,
-      "⏳ عکس رسید؛ دارم پس‌زمینه‌ش رو حذف می‌کنم..."
-    );
-
-    const original = await getPhotoBuffer(photo.file_id);
-    const transparent = await removeBackground(original);
-    const sticker = await makeSticker(transparent);
-
-    processedImages.set(userId, sticker);
-
-    await bot.sendDocument(
-      chatId,
-      transparent,
-      {
-        caption: "✨ اینم عکس با پس‌زمینه شفاف!",
-        filename: "transparent.png",
-        contentType: "image/png",
-        reply_markup: photoMenu()
+    if (action === "pack_title") {
+      if (!s.sticker) {
+        pending.delete(id);
+        return bot.sendMessage(chatId, "اول یک عکس بفرست تا استیکر آماده بشه.");
       }
-    );
 
-    await bot.deleteMessage(chatId, status.message_id)
-      .catch(() => {});
-  } catch (error) {
-    const statusCode = error.response?.status;
-    const apiDescription =
-      error.response?.data?.errors?.[0]?.title ||
-      error.response?.data?.description ||
-      error.message;
+      const title = msg.text.trim();
+      if (title.length < 1 || title.length > 64) {
+        return bot.sendMessage(chatId, "اسم پک باید بین ۱ تا ۶۴ حرف باشه.");
+      }
 
-    console.error("PHOTO ERROR:", statusCode, apiDescription);
+      const packName = await createPack(id, title, s.sticker);
+      pending.delete(id);
 
-    let message = "❌ پردازش عکس ناموفق بود.";
-
-    if (statusCode === 402 || statusCode === 403) {
-      message += "\nکلید یا اعتبار Remove.bg رو بررسی کن.";
-    } else if (statusCode === 429) {
-      message += "\nسهمیه یا محدودیت درخواست‌ها پر شده.";
-    } else if (error.message === "STICKER_TOO_LARGE") {
-      message += "\nحجم استیکر بیشتر از حد مجازه.";
+      return bot.sendMessage(
+        chatId,
+        `✨ پک ساخته شد!\nhttps://t.me/addstickers/${packName}`
+      );
     }
 
+    if (action === "pack_name") {
+      if (!s.sticker) {
+        pending.delete(id);
+        return bot.sendMessage(chatId, "اول یک عکس بفرست.");
+      }
+
+      const packName = msg.text.trim().replace(/^https?:\/\/t\.me\/addstickers\//, "");
+      if (!/^[A-Za-z0-9_]{1,64}$/.test(packName)) {
+        return bot.sendMessage(chatId, "نام پک معتبر نیست؛ دوباره بفرست.");
+      }
+
+      await addToPack(id, packName, s.sticker);
+      pending.delete(id);
+
+      return bot.sendMessage(
+        chatId,
+        `✨ استیکر اضافه شد!\nhttps://t.me/addstickers/${packName}`
+      );
+    }
+  } catch (error) {
+    console.error("PACK ERROR:", error.response?.data || error.message);
+    pending.delete(id);
     await bot.sendMessage(
       chatId,
-      message + "\nلطفاً دوباره امتحان کن یا عکس دیگه‌ای بفرست.",
-      { reply_markup: mainMenu }
+      "❌ عملیات انجام نشد. نام پک، سازندهٔ پک و دسترسی تلگرام رو بررسی کن."
     ).catch(() => {});
   }
 });
@@ -382,16 +293,4 @@ bot.on("polling_error", (error) => {
   console.error("POLLING ERROR:", error.message);
 });
 
-bot.getMe()
-  .then((me) => {
-    botUsername = me.username;
-    console.log(`Sticker bot started: @${botUsername}`);
-  })
-  .catch((error) => {
-    console.error("BOT AUTH ERROR:", error.message);
-    process.exit(1);
-  });
-
-process.on("unhandledRejection", (error) => {
-  console.error("UNHANDLED ERROR:", error);
-});
+console.log("Sticker bot started");
