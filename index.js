@@ -15,150 +15,235 @@ const TOKEN = process.env.BOT_TOKEN;
 const REMOVE_BG_KEY = process.env.REMOVE_BG_API_KEY;
 
 if (!TOKEN || !REMOVE_BG_KEY) {
-  throw new Error("BOT_TOKEN و REMOVE_BG_API_KEY تنظیم نشده‌اند.");
+  throw new Error(
+    "لطفاً BOT_TOKEN و REMOVE_BG_API_KEY را در GitHub Secrets تنظیم کن."
+  );
 }
 
 const bot = new TelegramBot(TOKEN, { polling: true });
+
 const sessions = new Map();
 const pending = new Map();
 const userPacks = new Map();
 
 const MAX_VIDEO_SIZE = 256 * 1024;
 
+function describeError(error) {
+  const data = error.response?.data;
+
+  if (Buffer.isBuffer(data)) {
+    const text = data.toString("utf8");
+
+    try {
+      const json = JSON.parse(text);
+      return json.description || json.message || text;
+    } catch {
+      return text.slice(0, 2000);
+    }
+  }
+
+  if (typeof data === "string") return data;
+
+  return (
+    data?.description ||
+    data?.message ||
+    error.stderr ||
+    error.message ||
+    "خطای نامشخص"
+  );
+}
+
+function logError(label, error) {
+  console.error(`\n${label}`);
+  console.error("STATUS:", error.response?.status || "N/A");
+  console.error("DETAIL:", describeError(error));
+}
+
 async function downloadFile(fileId) {
   const url = await bot.getFileLink(fileId);
+
   const response = await axios.get(url, {
     responseType: "arraybuffer",
     timeout: 120000
   });
+
   return Buffer.from(response.data);
 }
 
+// حذف پس‌زمینه از یک تصویر
 async function removeBackground(buffer) {
   const form = new FormData();
 
   form.append("image_file", buffer, {
-    filename: "image.png",
+    filename: "frame.png",
     contentType: "image/png"
   });
 
   form.append("size", "auto");
 
-  const response = await axios.post(
-    "https://api.remove.bg/v1.0/removebg",
-    form,
-    {
-      headers: {
-        ...form.getHeaders(),
-        "X-Api-Key": REMOVE_BG_KEY
-      },
-      responseType: "arraybuffer",
-      timeout: 120000,
-      maxBodyLength: Infinity
-    }
-  );
+  let response;
+
+  try {
+    response = await axios.post(
+      "https://api.remove.bg/v1.0/removebg",
+      form,
+      {
+        headers: {
+          ...form.getHeaders(),
+          "X-Api-Key": REMOVE_BG_KEY
+        },
+        responseType: "arraybuffer",
+        timeout: 120000,
+        maxBodyLength: Infinity
+      }
+    );
+  } catch (error) {
+    logError("REMOVE.BG ERROR", error);
+    throw new Error(
+      `Remove.bg: ${describeError(error)}`
+    );
+  }
 
   return Buffer.from(response.data);
 }
 
+// تبدیل عکس به استیکر شفاف
 async function makePhotoSticker(input) {
   const transparent = await removeBackground(input);
 
   return sharp(transparent)
     .resize(512, 512, {
       fit: "contain",
-      background: { r: 0, g: 0, b: 0, alpha: 0 }
+      background: {
+        r: 0,
+        g: 0,
+        b: 0,
+        alpha: 0
+      }
     })
-    .webp({ quality: 85, alphaQuality: 100 })
+    .webp({
+      quality: 85,
+      alphaQuality: 100
+    })
     .toBuffer();
 }
 
+// تبدیل فیلم کوتاه به استیکر ویدیویی شفاف
 async function makeVideoSticker(input) {
   const dir = await fs.mkdtemp(
-    path.join(os.tmpdir(), "transparent-sticker-")
+    path.join(os.tmpdir(), "sticker-")
   );
 
   try {
     const inputPath = path.join(dir, "input.mp4");
+    const outputPath = path.join(dir, "sticker.webm");
 
     await fs.writeFile(inputPath, input);
 
-    // استخراج حداکثر ۳ ثانیه با ۶ فریم در ثانیه
-    await execFileAsync("ffmpeg", [
-      "-y",
-      "-i", inputPath,
-      "-t", "3",
-      "-vf",
-      "fps=6,scale=512:512:force_original_aspect_ratio=decrease",
-      "-frames:v", "18",
-      path.join(dir, "raw_%03d.png")
-    ]);
+    // استخراج فریم‌ها؛ حداکثر ۳ ثانیه و ۶ فریم در ثانیه
+    try {
+      await execFileAsync("ffmpeg", [
+        "-y",
+        "-i", inputPath,
+        "-t", "3",
+        "-vf",
+        "fps=6,scale=512:512:force_original_aspect_ratio=decrease",
+        "-frames:v", "18",
+        path.join(dir, "raw_%03d.png")
+      ]);
+    } catch (error) {
+      logError("FFMPEG EXTRACT ERROR", error);
+      throw new Error("استخراج فریم‌های فیلم ناموفق بود.");
+    }
 
     const rawFrames = (await fs.readdir(dir))
       .filter(name => /^raw_\d+\.png$/.test(name))
       .sort();
 
     if (!rawFrames.length) {
-      throw new Error("هیچ فریمی از ویدیو استخراج نشد.");
+      throw new Error("هیچ فریمی از فیلم استخراج نشد.");
     }
 
-    // حذف پس‌زمینه از تک‌تک فریم‌ها
+    // حذف پس‌زمینهٔ تک‌تک فریم‌ها
     for (let i = 0; i < rawFrames.length; i++) {
+      console.log(
+        `Processing video frame ${i + 1}/${rawFrames.length}`
+      );
+
       const raw = await fs.readFile(
         path.join(dir, rawFrames[i])
       );
 
       const transparent = await removeBackground(raw);
 
-      const frame = await sharp(transparent)
+      const png = await sharp(transparent)
         .resize(512, 512, {
           fit: "contain",
-          background: { r: 0, g: 0, b: 0, alpha: 0 }
+          background: {
+            r: 0,
+            g: 0,
+            b: 0,
+            alpha: 0
+          }
         })
         .png()
         .toBuffer();
 
-      const frameName =
+      const filename =
         `frame_${String(i + 1).padStart(3, "0")}.png`;
 
-      await fs.writeFile(path.join(dir, frameName), frame);
+      await fs.writeFile(
+        path.join(dir, filename),
+        png
+      );
     }
 
-    const outputPath = path.join(dir, "sticker.webm");
-
-    // فشرده‌سازی ویدیوی شفاف برای تلگرام
-    let result;
+    // تلاش برای فشرده‌سازی تا رسیدن به محدودیت حجم تلگرام
+    let finalBuffer;
 
     for (const crf of [35, 40, 45, 50]) {
-      await execFileAsync("ffmpeg", [
-        "-y",
-        "-framerate", "6",
-        "-i", path.join(dir, "frame_%03d.png"),
-        "-frames:v", String(rawFrames.length),
-        "-an",
-        "-c:v", "libvpx-vp9",
-        "-pix_fmt", "yuva420p",
-        "-auto-alt-ref", "0",
-        "-b:v", "0",
-        "-crf", String(crf),
-        outputPath
-      ]);
+      try {
+        await execFileAsync("ffmpeg", [
+          "-y",
+          "-framerate", "6",
+          "-i", path.join(dir, "frame_%03d.png"),
+          "-frames:v", String(rawFrames.length),
+          "-an",
+          "-c:v", "libvpx-vp9",
+          "-pix_fmt", "yuva420p",
+          "-auto-alt-ref", "0",
+          "-b:v", "0",
+          "-crf", String(crf),
+          outputPath
+        ]);
+      } catch (error) {
+        logError("FFMPEG ENCODE ERROR", error);
+        throw new Error("ساخت ویدیوی شفاف ناموفق بود.");
+      }
 
-      result = await fs.readFile(outputPath);
+      finalBuffer = await fs.readFile(outputPath);
 
-      if (result.length <= MAX_VIDEO_SIZE) {
-        return result;
+      console.log(
+        `Video size: ${finalBuffer.length} bytes; CRF ${crf}`
+      );
+
+      if (finalBuffer.length <= MAX_VIDEO_SIZE) {
+        return finalBuffer;
       }
     }
 
     throw new Error(
-      "حجم ویدیو پس از فشرده‌سازی هنوز بیشتر از ۲۵۶ کیلوبایت است."
+      "حجم ویدیوی خروجی از ۲۵۶ کیلوبایت بیشتر است."
     );
   } finally {
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, {
+      recursive: true,
+      force: true
+    });
   }
 }
 
+// ارسال استیکر ساخته‌شده به کاربر
 async function sendSticker(chatId, userId, buffer, format) {
   const isVideo = format === "video";
   const filename = isVideo ? "sticker.webm" : "sticker.webp";
@@ -168,7 +253,10 @@ async function sendSticker(chatId, userId, buffer, format) {
     chatId,
     buffer,
     {},
-    { filename, contentType }
+    {
+      filename,
+      contentType
+    }
   );
 
   sessions.set(String(userId), {
@@ -179,31 +267,31 @@ async function sendSticker(chatId, userId, buffer, format) {
     fileId: sent.sticker.file_id
   });
 
-  await bot.sendMessage(chatId, "استیکرت آماده شد! ✨", {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "📦 ساخت پک جدید", callback_data: "newpack" }],
-        [{ text: "➕ افزودن به پک", callback_data: "addpack" }]
-      ]
+  await bot.sendMessage(
+    chatId,
+    "استیکرت آماده شد! ✨",
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "📦 ساخت پک جدید",
+              callback_data: "newpack"
+            }
+          ],
+          [
+            {
+              text: "➕ افزودن به پک",
+              callback_data: "addpack"
+            }
+          ]
+        ]
+      }
     }
-  });
+  );
 }
 
-function getErrorMessage(error) {
-  const data = error.response?.data;
-
-  if (data) {
-    try {
-      const parsed = JSON.parse(Buffer.from(data).toString("utf8"));
-      return parsed.message || parsed.description || error.message;
-    } catch (_) {
-      return error.message;
-    }
-  }
-
-  return error.message;
-}
-
+// پردازش عکس
 async function processPhoto(msg) {
   const chatId = msg.chat.id;
 
@@ -217,42 +305,52 @@ async function processPhoto(msg) {
     const input = await downloadFile(photo.file_id);
     const sticker = await makePhotoSticker(input);
 
-    await sendSticker(chatId, msg.from.id, sticker, "static");
+    await sendSticker(
+      chatId,
+      msg.from.id,
+      sticker,
+      "static"
+    );
   } catch (error) {
-    console.error("PHOTO ERROR:", getErrorMessage(error));
+    logError("PHOTO ERROR", error);
 
     await bot.sendMessage(
       chatId,
-      "ساخت استیکر عکس ناموفق بود. کلید Remove.bg و اعتبار API رو بررسی کن."
+      `ساخت استیکر عکس ناموفق بود.\n${describeError(error).slice(0, 800)}`
     );
   }
 }
 
+// پردازش فیلم
 async function processVideo(msg, fileId) {
   const chatId = msg.chat.id;
 
   try {
     await bot.sendMessage(
       chatId,
-      "دارم پس‌زمینهٔ فریم‌های فیلم رو حذف می‌کنم؛ کمی صبر کن... 🌙"
+      "دارم فریم‌های فیلم رو پردازش می‌کنم؛ لطفاً صبر کن... 🌙"
     );
 
     const input = await downloadFile(fileId);
     const sticker = await makeVideoSticker(input);
 
-    await sendSticker(chatId, msg.from.id, sticker, "video");
+    await sendSticker(
+      chatId,
+      msg.from.id,
+      sticker,
+      "video"
+    );
   } catch (error) {
-    console.error("VIDEO ERROR:", getErrorMessage(error));
+    logError("VIDEO ERROR", error);
 
     await bot.sendMessage(
       chatId,
-      "ساخت استیکر فیلم ناموفق بود.\n" +
-      "ممکنه اعتبار API تموم شده باشه، فرمت فیلم پشتیبانی نشه " +
-      "یا حجم استیکر از محدودیت تلگرام بیشتر باشه."
+      `ساخت استیکر فیلم ناموفق بود.\n${describeError(error).slice(0, 800)}`
     );
   }
 }
 
+// ساخت نام مناسب برای پک
 function makePackName(title, username) {
   const slug = title
     .toLowerCase()
@@ -270,44 +368,65 @@ function makePackName(title, username) {
   return `${slug}_by_${username}`;
 }
 
-async function telegramMultipart(method, fields, buffer, filename, contentType) {
+// ارسال درخواست چندبخشی به Telegram Bot API
+async function telegramMultipart(
+  method,
+  fields,
+  buffer,
+  filename,
+  contentType
+) {
   const form = new FormData();
 
   for (const [key, value] of Object.entries(fields)) {
     form.append(
       key,
-      typeof value === "string" ? value : JSON.stringify(value)
+      typeof value === "string"
+        ? value
+        : JSON.stringify(value)
     );
   }
 
-  // نام فایل جداست تا با فیلد JSON استیکر تداخل نداشته باشد.
   form.append("sticker_file", buffer, {
     filename,
     contentType
   });
 
-  const response = await axios.post(
-    `https://api.telegram.org/bot${TOKEN}/${method}`,
-    form,
-    {
-      headers: form.getHeaders(),
-      timeout: 120000,
-      maxBodyLength: Infinity
-    }
-  );
+  let response;
+
+  try {
+    response = await axios.post(
+      `https://api.telegram.org/bot${TOKEN}/${method}`,
+      form,
+      {
+        headers: form.getHeaders(),
+        timeout: 120000,
+        maxBodyLength: Infinity
+      }
+    );
+  } catch (error) {
+    logError(`TELEGRAM ${method} ERROR`, error);
+    throw new Error(describeError(error));
+  }
 
   if (!response.data.ok) {
-    throw new Error(response.data.description || "خطای تلگرام");
+    throw new Error(
+      response.data.description || "درخواست تلگرام ناموفق بود."
+    );
   }
 
   return response.data.result;
 }
 
+// ساخت پک جدید با استیکر فعلی
 async function createPack(userId, title, chatId) {
   const session = sessions.get(String(userId));
 
   if (!session) {
-    return bot.sendMessage(chatId, "اول یک عکس یا فیلم بفرست.");
+    return bot.sendMessage(
+      chatId,
+      "اول یک عکس یا فیلم بفرست و استیکر بساز."
+    );
   }
 
   try {
@@ -320,11 +439,13 @@ async function createPack(userId, title, chatId) {
         user_id: String(userId),
         name,
         title: title.slice(0, 64),
-        stickers: [{
-          sticker: "attach://sticker_file",
-          format: session.format,
-          emoji_list: ["✨"]
-        }]
+        stickers: [
+          {
+            sticker: "attach://sticker_file",
+            format: session.format,
+            emoji_list: ["✨"]
+          }
+        ]
       },
       session.buffer,
       session.filename,
@@ -342,20 +463,24 @@ async function createPack(userId, title, chatId) {
       `پک ساخته شد! ✨\n${link}`
     );
   } catch (error) {
-    console.error("CREATE PACK ERROR:", getErrorMessage(error));
+    logError("CREATE PACK ERROR", error);
 
     await bot.sendMessage(
       chatId,
-      `ساخت پک ناموفق بود:\n${getErrorMessage(error)}`
+      `ساخت پک ناموفق بود:\n${describeError(error).slice(0, 800)}`
     );
   }
 }
 
+// اضافه کردن استیکر به پک موجود
 async function addToPack(userId, packName, chatId) {
   const session = sessions.get(String(userId));
 
   if (!session) {
-    return bot.sendMessage(chatId, "اول یک استیکر بساز.");
+    return bot.sendMessage(
+      chatId,
+      "اول یک استیکر بساز."
+    );
   }
 
   try {
@@ -375,13 +500,16 @@ async function addToPack(userId, packName, chatId) {
       session.contentType
     );
 
-    await bot.sendMessage(chatId, "استیکر به پک اضافه شد! ✨");
+    await bot.sendMessage(
+      chatId,
+      "استیکر به پک اضافه شد! ✨"
+    );
   } catch (error) {
-    console.error("ADD PACK ERROR:", getErrorMessage(error));
+    logError("ADD PACK ERROR", error);
 
     await bot.sendMessage(
       chatId,
-      `افزودن استیکر ناموفق بود:\n${getErrorMessage(error)}`
+      `افزودن استیکر ناموفق بود:\n${describeError(error).slice(0, 800)}`
     );
   }
 }
@@ -391,7 +519,7 @@ bot.onText(/^\/start$/, async msg => {
     msg.chat.id,
     "سلام! 🍄\n\n" +
     "عکس یا فیلم کوتاه بفرست تا پس‌زمینه‌ش رو حذف کنم " +
-    "و به استیکر تبدیلش کنم.\n\n" +
+    "و به استیکر شفاف تبدیلش کنم.\n\n" +
     "بعدش می‌تونی پک خودت رو بسازی.",
     {
       reply_markup: {
@@ -429,7 +557,7 @@ bot.on("callback_query", async query => {
 
     return bot.sendMessage(
       chatId,
-      "اسم پک رو بفرست. بهتره انگلیسی و کوتاه باشه."
+      "اسم پک رو بفرست؛ بهتره انگلیسی و کوتاه باشه."
     );
   }
 
@@ -445,14 +573,20 @@ bot.on("callback_query", async query => {
       );
     }
 
-    return bot.sendMessage(chatId, "کدوم پک؟", {
-      reply_markup: {
-        inline_keyboard: packs.map((pack, index) => [{
-          text: pack.title,
-          callback_data: `pack:${index}`
-        }])
+    return bot.sendMessage(
+      chatId,
+      "کدوم پک؟",
+      {
+        reply_markup: {
+          inline_keyboard: packs.map((pack, index) => [
+            {
+              text: pack.title,
+              callback_data: `pack:${index}`
+            }
+          ])
+        }
       }
-    });
+    );
   }
 
   if (query.data.startsWith("pack:")) {
@@ -482,7 +616,10 @@ bot.on("message", async msg => {
     pending.delete(userId);
 
     const input = msg.text.trim();
-    const match = input.match(/(?:addstickers\/)?([A-Za-z0-9_]+_by_[A-Za-z0-9_]+)/);
+    const match = input.match(
+      /(?:addstickers\/)?([A-Za-z0-9_]+_by_[A-Za-z0-9_]+)/
+    );
+
     const name = match ? match[1] : input;
 
     return addToPack(userId, name, chatId);
