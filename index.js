@@ -3,6 +3,13 @@ const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const FormData = require("form-data");
 const sharp = require("sharp");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
+const fs = require("fs/promises");
+const os = require("os");
+const path = require("path");
+
+const execFileAsync = promisify(execFile);
 
 const TOKEN = process.env.BOT_TOKEN;
 const REMOVE_BG_KEY = process.env.REMOVE_BG_API_KEY;
@@ -12,113 +19,78 @@ if (!TOKEN || !REMOVE_BG_KEY) {
 }
 
 const bot = new TelegramBot(TOKEN, { polling: true });
-
 const sessions = new Map();
 const pending = new Map();
 const userPacks = new Map();
 
-const mainMenu = {
-  inline_keyboard: [
-    [{ text: "✂️ ساخت استیکر", callback_data: "remove" }],
-    [{ text: "📦 پک‌های من", callback_data: "my_packs" }]
-  ]
-};
+const MAX_VIDEO_BYTES = 20 * 1024 * 1024;
+const MAX_STICKER_BYTES = 256 * 1024;
 
-function getSession(id) {
-  if (!sessions.has(id)) sessions.set(id, {});
-  return sessions.get(id);
-}
+let botUsername = "";
 
-function getPacks(id) {
-  if (!userPacks.has(id)) userPacks.set(id, []);
-  return userPacks.get(id);
-}
-
-function errorDetails(error) {
-  const data = error.response?.data;
-
-  if (Buffer.isBuffer(data)) {
-    const text = data.toString("utf8");
-    try {
-      return JSON.stringify(JSON.parse(text));
-    } catch {
-      return text.slice(0, 1500);
+function mainKeyboard() {
+  return {
+    reply_markup: {
+      keyboard: [
+        [{ text: "✂️ ساخت استیکر از عکس" }],
+        [{ text: "📦 پک‌های من" }]
+      ],
+      resize_keyboard: true
     }
-  }
-
-  if (data && typeof data === "object") {
-    return JSON.stringify(data);
-  }
-
-  return String(data || error.message || "خطای نامشخص");
+  };
 }
 
-function userError(error) {
-  const status = error.response?.status;
-  const details = errorDetails(error);
-
-  console.error("PROCESS ERROR:", status || "", details);
-
-  if (status === 401 || status === 403) {
-    return "کلید Remove.bg نامعتبر است یا دسترسی ندارد.";
-  }
-
-  if (status === 402) {
-    return "اعتبار Remove.bg کافی نیست.";
-  }
-
-  if (status === 429) {
-    return "تعداد درخواست‌ها زیاد شده؛ کمی بعد دوباره امتحان کن.";
-  }
-
-  if (error.code === "ECONNABORTED") {
-    return "پردازش عکس طول کشید؛ دوباره امتحان کن.";
-  }
-
-  if (details.includes("STICKER_PNG_DIMENSIONS")) {
-    return "تلگرام ابعاد استیکر را قبول نکرد. لاگ GitHub Actions را بررسی کن.";
-  }
-
-  if (details.includes("STICKER_PNG_FILESIZE")) {
-    return "حجم استیکر از حد مجاز تلگرام بیشتر شده است.";
-  }
-
-  return "پردازش ناموفق بود. جزئیات خطا در GitHub Actions ثبت شده است.";
+function stickerKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "➕ ساخت پک جدید", callback_data: "newpack" },
+          { text: "📦 افزودن به پک", callback_data: "addpack" }
+        ],
+        [{ text: "🔄 ساخت استیکر دیگر", callback_data: "again" }]
+      ]
+    }
+  };
 }
 
-bot.onText(/^\/start$/, async (msg) => {
-  await bot.sendMessage(
-    msg.chat.id,
-    "🌙 به استیکرساز خوش اومدی!\nعکست رو بفرست تا پس‌زمینه‌ش رو حذف کنیم.",
-    { reply_markup: mainMenu }
-  );
-});
+function getPacks(userId, format) {
+  return (userPacks.get(String(userId)) || [])
+    .filter(pack => pack.format === format);
+}
 
-async function getFile(fileId) {
+function getSession(userId) {
+  return sessions.get(String(userId));
+}
+
+async function downloadTelegramFile(fileId, maxBytes = MAX_VIDEO_BYTES) {
   const file = await bot.getFile(fileId);
 
-  const url =
-    `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`;
+  if (!file.file_path) {
+    throw new Error("فایل تلگرام پیدا نشد.");
+  }
 
-  const response = await axios.get(url, {
-    responseType: "arraybuffer",
-    timeout: 60000,
-    maxContentLength: 20 * 1024 * 1024
-  });
+  const response = await axios.get(
+    `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`,
+    {
+      responseType: "arraybuffer",
+      timeout: 120000,
+      maxContentLength: maxBytes
+    }
+  );
 
   return Buffer.from(response.data);
 }
 
-async function removeBackground(buffer) {
+async function removeBackground(imageBuffer) {
   const form = new FormData();
 
-  form.append("image_file", buffer, {
-    filename: "photo.jpg",
+  form.append("image_file", imageBuffer, {
+    filename: "image.jpg",
     contentType: "application/octet-stream"
   });
 
   form.append("size", "auto");
-  form.append("format", "png");
 
   const response = await axios.post(
     "https://api.remove.bg/v1.0/removebg",
@@ -130,374 +102,474 @@ async function removeBackground(buffer) {
       },
       responseType: "arraybuffer",
       timeout: 120000,
-      maxBodyLength: 20 * 1024 * 1024
+      maxBodyLength: Infinity
     }
   );
 
   return Buffer.from(response.data);
 }
 
-// ساخت PNG شفاف با ابعاد استاندارد استیکر تلگرام
-async function makeSticker(buffer) {
-  const result = await sharp(buffer)
-    .rotate()
-    .ensureAlpha()
+async function preparePhotoSticker(imageBuffer) {
+  const transparent = await removeBackground(imageBuffer);
+
+  return sharp(transparent)
     .resize(512, 512, {
-      fit: "inside",
-      withoutEnlargement: false
+      fit: "contain",
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
     })
-    .png({
-      compressionLevel: 9,
-      palette: true,
-      effort: 10,
-      colours: 256
-    })
+    .png()
     .toBuffer();
-
-  const metadata = await sharp(result).metadata();
-
-  if (!metadata.width || !metadata.height) {
-    throw new Error("ابعاد تصویر خروجی قابل تشخیص نیست.");
-  }
-
-  if (Math.max(metadata.width, metadata.height) !== 512) {
-    throw new Error(
-      `ابعاد نامعتبر است: ${metadata.width}x${metadata.height}`
-    );
-  }
-
-  if (result.length > 512 * 1024) {
-    throw new Error(
-      `حجم استیکر بیش از 512KB است: ${result.length} bytes`
-    );
-  }
-
-  console.log(
-    `Sticker prepared: ${metadata.width}x${metadata.height}, ${result.length} bytes`
-  );
-
-  return result;
 }
 
-async function uploadSticker(method, fields, buffer) {
+async function makeVideoSticker(videoBuffer) {
+  const folder = await fs.mkdtemp(
+    path.join(os.tmpdir(), "telegram-sticker-")
+  );
+
+  const input = path.join(folder, "input.mp4");
+  const output = path.join(folder, "sticker.webm");
+
+  try {
+    await fs.writeFile(input, videoBuffer);
+
+    for (const crf of [32, 38, 44, 50, 55]) {
+      try {
+        await fs.unlink(output);
+      } catch {}
+
+      await execFileAsync("ffmpeg", [
+        "-y",
+        "-i", input,
+        "-t", "3",
+        "-an",
+        "-vf",
+        "scale=512:512:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30,format=yuva420p",
+        "-c:v", "libvpx-vp9",
+        "-pix_fmt", "yuva420p",
+        "-b:v", "0",
+        "-crf", String(crf),
+        "-deadline", "good",
+        "-cpu-used", "4",
+        "-auto-alt-ref", "0",
+        "-f", "webm",
+        output
+      ], { timeout: 180000 });
+
+      const result = await fs.readFile(output);
+
+      if (result.length <= MAX_STICKER_BYTES) {
+        return result;
+      }
+    }
+
+    throw new Error(
+      "حجم ویدئو هنوز بیشتر از ۲۵۶ کیلوبایت است؛ یک فیلم کوتاه‌تر بفرست."
+    );
+  } finally {
+    await fs.rm(folder, { recursive: true, force: true });
+  }
+}
+
+async function telegramMultipart(method, fields, buffer, filename, contentType) {
   const form = new FormData();
 
   for (const [key, value] of Object.entries(fields)) {
     form.append(
       key,
-      typeof value === "object" ? JSON.stringify(value) : String(value)
+      typeof value === "string" ? value : JSON.stringify(value)
     );
   }
 
-  form.append("sticker", buffer, {
-    filename: "sticker.png",
-    contentType: "image/png"
-  });
+  if (buffer) {
+    form.append("file0", buffer, {
+      filename,
+      contentType
+    });
+  }
 
   const response = await axios.post(
     `https://api.telegram.org/bot${TOKEN}/${method}`,
     form,
     {
       headers: form.getHeaders(),
-      timeout: 120000,
-      maxBodyLength: 2 * 1024 * 1024
+      maxBodyLength: Infinity,
+      timeout: 120000
     }
   );
 
   if (!response.data.ok) {
-    throw new Error(
-      response.data.description || "خطای Telegram API"
-    );
+    throw new Error(response.data.description || "خطای تلگرام");
   }
 
   return response.data.result;
 }
 
-async function createPack(userId, title, sticker) {
-  const me = await bot.getMe();
-  const botName = me.username.replace(/[^a-zA-Z0-9_]/g, "");
-  const packName = `user${userId}_${Date.now()}_by_${botName}`;
+async function sendPreparedSticker(chatId, userId, buffer, format) {
+  const filename = format === "video" ? "sticker.webm" : "sticker.png";
+  const contentType = format === "video" ? "video/webm" : "image/png";
 
-  await uploadSticker(
+  const sent = await bot.sendSticker(
+    chatId,
+    buffer,
+    {},
+    { filename, contentType }
+  );
+
+  sessions.set(String(userId), {
+    buffer,
+    format,
+    filename,
+    contentType,
+    stickerFileId: sent.sticker.file_id
+  });
+
+  await bot.sendMessage(
+    chatId,
+    "استیکرت آماده شد! ✨",
+    stickerKeyboard()
+  );
+}
+
+async function createPack(userId, title) {
+  const session = getSession(userId);
+
+  if (!session) {
+    throw new Error("اول یک استیکر بساز.");
+  }
+
+  const cleanTitle = title.trim().slice(0, 64);
+
+  if (!cleanTitle) {
+    throw new Error("اسم پک خالیه.");
+  }
+
+  const name =
+    `stickers_${userId}_${Date.now()}_by_${botUsername}`.toLowerCase();
+
+  await telegramMultipart(
     "createNewStickerSet",
     {
-      user_id: userId,
-      name: packName,
-      title: title.slice(0, 64),
+      user_id: String(userId),
+      name,
+      title: cleanTitle,
+      sticker_type: "regular",
       stickers: [{
-        sticker: "attach://sticker",
-        format: "static",
+        sticker: "attach://file0",
+        format: session.format,
         emoji_list: ["✨"]
       }]
     },
-    sticker
+    session.buffer,
+    session.filename,
+    session.contentType
   );
 
-  const pack = { title, name: packName };
-  getPacks(userId).push(pack);
+  const pack = {
+    name,
+    title: cleanTitle,
+    format: session.format,
+    link: `https://t.me/addstickers/${name}`
+  };
+
+  const key = String(userId);
+  const packs = userPacks.get(key) || [];
+
+  packs.push(pack);
+  userPacks.set(key, packs);
 
   return pack;
 }
 
-async function addToPack(userId, packName, sticker) {
-  await uploadSticker(
+async function addToPack(userId, pack) {
+  const session = getSession(userId);
+
+  if (!session) {
+    throw new Error("اول یک استیکر بساز.");
+  }
+
+  if (pack.format !== session.format) {
+    throw new Error("نوع استیکر با این پک هماهنگ نیست.");
+  }
+
+  await telegramMultipart(
     "addStickerToSet",
     {
-      user_id: userId,
-      name: packName,
+      user_id: String(userId),
+      name: pack.name,
       sticker: {
-        sticker: "attach://sticker",
-        format: "static",
+        sticker: "attach://file0",
+        format: session.format,
         emoji_list: ["✨"]
       }
     },
-    sticker
+    session.buffer,
+    session.filename,
+    session.contentType
   );
 }
 
-function packKeyboard(id) {
-  const rows = [
-    [{ text: "📦 ساخت پک جدید", callback_data: "create_pack" }]
-  ];
+async function showPackKeyboard(chatId, userId) {
+  const session = getSession(userId);
 
-  getPacks(id).forEach((pack, index) => {
-    rows.push([{
-      text: `➕ ${pack.title}`.slice(0, 64),
-      callback_data: `choose_pack:${index}`
-    }]);
-  });
+  if (!session) {
+    await bot.sendMessage(chatId, "اول یک استیکر بساز.");
+    return;
+  }
 
-  rows.push([
-    { text: "🏠 منوی اصلی", callback_data: "home" }
-  ]);
+  const packs = getPacks(userId, session.format);
 
-  return { inline_keyboard: rows };
+  if (!packs.length) {
+    await bot.sendMessage(
+      chatId,
+      "هنوز پک هم‌نوعی نداری. اول پک جدید بساز."
+    );
+    return;
+  }
+
+  const rows = packs.map((pack, index) => [{
+    text: `📦 ${pack.title}`,
+    callback_data: `pack:${index}`
+  }]);
+
+  await bot.sendMessage(
+    chatId,
+    "استیکر رو به کدوم پک اضافه کنم؟",
+    { reply_markup: { inline_keyboard: rows } }
+  );
 }
 
-bot.on("callback_query", async (q) => {
-  await bot.answerCallbackQuery(q.id).catch(() => {});
-
-  const id = q.from.id;
-  const chatId = q.message?.chat?.id;
-
-  if (!chatId) return;
-
-  const s = getSession(id);
-
-  try {
-    if (q.data === "home") {
-      return bot.sendMessage(chatId, "🏠 منوی اصلی", {
-        reply_markup: mainMenu
-      });
-    }
-
-    if (q.data === "remove") {
-      pending.set(id, "photo");
-
-      return bot.sendMessage(chatId, "📸 عکست رو بفرست.");
-    }
-
-    if (q.data === "my_packs") {
-      if (!getPacks(id).length) {
-        return bot.sendMessage(
-          chatId,
-          "هنوز پکی نداری؛ اول یک استیکر بساز."
-        );
-      }
-
-      return bot.sendMessage(chatId, "📚 پک‌هات:", {
-        reply_markup: packKeyboard(id)
-      });
-    }
-
-    if (q.data === "create_pack") {
-      if (!s.sticker) {
-        return bot.sendMessage(
-          chatId,
-          "اول یک عکس بفرست تا استیکر آماده بشه."
-        );
-      }
-
-      pending.set(id, "pack_title");
-
-      return bot.sendMessage(
-        chatId,
-        "✨ اسم نمایشی پک جدیدت رو بفرست:"
-      );
-    }
-
-    if (q.data.startsWith("choose_pack:")) {
-      const index = Number(q.data.split(":")[1]);
-      const pack = getPacks(id)[index];
-
-      if (!pack || !s.sticker) {
-        return bot.sendMessage(
-          chatId,
-          "پک یا استیکر پیدا نشد."
-        );
-      }
-
-      await bot.sendMessage(
-        chatId,
-        "⏳ دارم استیکر رو اضافه می‌کنم..."
-      );
-
-      await addToPack(id, pack.name, s.sticker);
-
-      return bot.sendMessage(
-        chatId,
-        `✨ استیکر اضافه شد!\n🔗 https://t.me/addstickers/${pack.name}`,
-        { reply_markup: mainMenu }
-      );
-    }
-  } catch (error) {
-    console.error(
-      "CALLBACK ERROR:",
-      error.response?.status || "",
-      errorDetails(error),
-      error.stack || ""
-    );
-
-    return bot.sendMessage(
-      chatId,
-      "❌ انجام این کار ناموفق بود. جزئیات خطا در GitHub Actions ثبت شده است."
-    ).catch(() => {});
-  }
-});
-
-bot.on("photo", async (msg) => {
-  const id = msg.from.id;
+async function processPhoto(msg) {
   const chatId = msg.chat.id;
-  const s = getSession(id);
+  const userId = msg.from.id;
 
   try {
-    await bot.sendMessage(
-      chatId,
-      "⏳ دارم استیکرت رو آماده می‌کنم..."
-    );
+    await bot.sendMessage(chatId, "دارم پس‌زمینه عکس رو حذف می‌کنم... ✂️");
 
     const photo = msg.photo[msg.photo.length - 1];
-    const original = await getFile(photo.file_id);
-    const transparent = await removeBackground(original);
-    const sticker = await makeSticker(transparent);
+    const image = await downloadTelegramFile(photo.file_id);
+    const sticker = await preparePhotoSticker(image);
 
-    s.sticker = sticker;
-
-    // اگر کاربر در حال ساخت پک جدید است،
-    // استیکر را آماده می‌کنیم و نام پک را می‌پرسیم.
-    if (pending.get(id) === "pack_title") {
-      await bot.sendSticker(chatId, sticker);
-
-      return bot.sendMessage(
-        chatId,
-        "💫 استیکر آماده شد! حالا اسم پک جدیدت رو بفرست."
-      );
-    }
-
-    let previewPack = getPacks(id)[0];
-
-    if (!previewPack) {
-      await bot.sendMessage(
-        chatId,
-        "📦 دارم اولین پک اختصاصی‌ات رو می‌سازم..."
-      );
-
-      previewPack = await createPack(
-        id,
-        "My Stickers",
-        sticker
-      );
-    } else {
-      await addToPack(id, previewPack.name, sticker);
-    }
-
-    // ارسال به‌صورت استیکر قابل مشاهده در تلگرام
-    await bot.sendSticker(chatId, sticker);
-
-    await bot.sendMessage(
-      chatId,
-      `💫 استیکرت آماده شد!\n🔗 https://t.me/addstickers/${previewPack.name}\nمی‌تونی پک دیگه‌ای انتخاب کنی یا پک جدید بسازی.`,
-      { reply_markup: packKeyboard(id) }
-    );
+    await sendPreparedSticker(chatId, userId, sticker, "static");
   } catch (error) {
-    console.error(
-      "PHOTO ERROR:",
-      error.response?.status || "",
-      errorDetails(error),
-      error.stack || ""
-    );
-
+    console.error("Photo error:", error.response?.data || error.message);
     await bot.sendMessage(
       chatId,
-      userError(error)
-    ).catch(() => {});
+      "ساخت استیکر عکس ناموفق بود. دوباره امتحان کن."
+    );
   }
-});
+}
 
-bot.on("message", async (msg) => {
-  if (!msg.text || msg.text.startsWith("/")) return;
-
-  const id = msg.from.id;
+async function processVideo(msg, media) {
   const chatId = msg.chat.id;
+  const userId = msg.from.id;
 
-  if (pending.get(id) !== "pack_title") return;
-
-  const s = getSession(id);
-
-  if (!s.sticker) {
-    pending.delete(id);
-
-    return bot.sendMessage(
+  if (media.file_size && media.file_size > MAX_VIDEO_BYTES) {
+    await bot.sendMessage(
       chatId,
-      "اول یک عکس بفرست."
+      "حجم ویدئو باید کمتر از ۲۰ مگابایت باشه."
     );
+    return;
   }
-
-  const title = msg.text.trim();
-
-  if (!title || title.length > 64) {
-    return bot.sendMessage(
-      chatId,
-      "اسم پک باید بین ۱ تا ۶۴ کاراکتر باشه."
-    );
-  }
-
-  pending.delete(id);
 
   try {
     await bot.sendMessage(
       chatId,
-      "⏳ دارم پک جدیدت رو می‌سازم..."
+      "دارم ویدئو رو به استیکر متحرک تبدیل می‌کنم... 🎬"
     );
 
-    const pack = await createPack(
-      id,
-      title,
-      s.sticker
-    );
+    const video = await downloadTelegramFile(media.file_id);
+    const sticker = await makeVideoSticker(video);
 
-    await bot.sendMessage(
-      chatId,
-      `🎉 پک ساخته شد!\n🔗 https://t.me/addstickers/${pack.name}`,
-      { reply_markup: mainMenu }
-    );
+    await sendPreparedSticker(chatId, userId, sticker, "video");
   } catch (error) {
-    console.error(
-      "CREATE ERROR:",
-      error.response?.status || "",
-      errorDetails(error),
-      error.stack || ""
-    );
+    console.error("Video error:", error.response?.data || error.message);
 
     await bot.sendMessage(
       chatId,
-      "❌ ساخت پک ناموفق بود. جزئیات خطا در GitHub Actions ثبت شده است."
+      `تبدیل ویدئو ناموفق بود:\n${String(error.message).slice(0, 500)}`
     );
+  }
+}
+
+bot.onText(/\/start/, async msg => {
+  pending.delete(String(msg.from.id));
+
+  await bot.sendMessage(
+    msg.chat.id,
+    "سلام! 🍄\nعکس بفرست تا استیکر بسازم، یا فیلم کوتاه بفرست تا استیکر متحرک بسازم.",
+    mainKeyboard()
+  );
+});
+
+bot.on("photo", processPhoto);
+
+bot.on("video", msg => processVideo(msg, msg.video));
+
+bot.on("animation", msg => processVideo(msg, msg.animation));
+
+bot.on("document", msg => {
+  const doc = msg.document;
+
+  if (doc?.mime_type?.startsWith("video/")) {
+    return processVideo(msg, doc);
   }
 });
 
-bot.on("polling_error", (error) => {
-  console.error("POLLING ERROR:", error.message);
+bot.on("message", async msg => {
+  if (!msg.text || msg.text.startsWith("/")) return;
+
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const key = String(userId);
+  const text = msg.text.trim();
+
+  if (pending.get(key)?.type === "pack_title") {
+    pending.delete(key);
+
+    try {
+      await bot.sendMessage(chatId, "دارم پک رو می‌سازم... 📦");
+
+      const pack = await createPack(userId, text);
+
+      await bot.sendMessage(
+        chatId,
+        `پک ساخته شد! 🎉\n${pack.title}\n${pack.link}`,
+        mainKeyboard()
+      );
+    } catch (error) {
+      console.error("Create pack error:", error.response?.data || error.message);
+
+      await bot.sendMessage(
+        chatId,
+        `ساخت پک ناموفق بود:\n${String(error.message).slice(0, 500)}`
+      );
+    }
+
+    return;
+  }
+
+  if (text === "✂️ ساخت استیکر از عکس") {
+    await bot.sendMessage(
+      chatId,
+      "یک عکس بفرست تا پس‌زمینه‌اش رو حذف کنم. 🖼️",
+      mainKeyboard()
+    );
+    return;
+  }
+
+  if (text === "📦 پک‌های من") {
+    const packs = userPacks.get(key) || [];
+
+    if (!packs.length) {
+      await bot.sendMessage(
+        chatId,
+        "هنوز پکی نساختی. اول یک استیکر بساز.",
+        mainKeyboard()
+      );
+      return;
+    }
+
+    const list = packs.map((pack, i) =>
+      `${i + 1}. ${pack.format === "video" ? "🎬" : "✨"} ${pack.title}\n${pack.link}`
+    );
+
+    await bot.sendMessage(chatId, list.join("\n\n"), mainKeyboard());
+  }
 });
 
-console.log("Sticker bot started");
+bot.on("callback_query", async query => {
+  const userId = query.from.id;
+  const chatId = query.message.chat.id;
+  const key = String(userId);
+  const data = query.data;
+
+  try {
+    await bot.answerCallbackQuery(query.id);
+
+    if (data === "newpack") {
+      if (!getSession(userId)) {
+        await bot.sendMessage(chatId, "اول یک استیکر بساز.");
+        return;
+      }
+
+      pending.set(key, { type: "pack_title" });
+
+      await bot.sendMessage(
+        chatId,
+        "اسم پک جدیدت رو بفرست:"
+      );
+      return;
+    }
+
+    if (data === "addpack") {
+      await showPackKeyboard(chatId, userId);
+      return;
+    }
+
+    if (data === "again") {
+      await bot.sendMessage(
+        chatId,
+        "یک عکس یا ویدئوی کوتاه بفرست.",
+        mainKeyboard()
+      );
+      return;
+    }
+
+    if (data.startsWith("pack:")) {
+      const session = getSession(userId);
+
+      if (!session) {
+        await bot.sendMessage(chatId, "اول یک استیکر بساز.");
+        return;
+      }
+
+      const index = Number(data.split(":")[1]);
+      const packs = getPacks(userId, session.format);
+      const pack = packs[index];
+
+      if (!pack) {
+        await bot.sendMessage(
+          chatId,
+          "این پک پیدا نشد یا نوعش با استیکر هماهنگ نیست."
+        );
+        return;
+      }
+
+      await bot.sendMessage(
+        chatId,
+        "دارم استیکر رو به پک اضافه می‌کنم... 📦"
+      );
+
+      await addToPack(userId, pack);
+
+      await bot.sendMessage(
+        chatId,
+        `استیکر به پک اضافه شد! ✨\n${pack.link}`,
+        mainKeyboard()
+      );
+    }
+  } catch (error) {
+    console.error("Callback error:", error.response?.data || error.message);
+
+    await bot.sendMessage(
+      chatId,
+      `عملیات انجام نشد:\n${String(error.message).slice(0, 500)}`
+    ).catch(() => {});
+  }
+});
+
+bot.on("polling_error", error => {
+  console.error("Polling error:", error.message);
+});
+
+(async () => {
+  try {
+    const me = await bot.getMe();
+    botUsername = me.username;
+
+    console.log(`Sticker bot is running: @${botUsername}`);
+  } catch (error) {
+    console.error("Startup error:", error.message);
+    process.exit(1);
+  }
+})();
