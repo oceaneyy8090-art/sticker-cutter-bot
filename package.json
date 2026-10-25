@@ -2,7 +2,7 @@
 {
   "name": "sticker-cutter-bot",
   "version": "1.0.0",
-  "description": "Telegram sticker maker",
+  "description": "Telegram sticker maker with transparent photo and video stickers",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
